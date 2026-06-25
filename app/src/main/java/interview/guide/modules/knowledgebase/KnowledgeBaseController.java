@@ -6,11 +6,14 @@ import interview.guide.modules.knowledgebase.model.KnowledgeBaseListItemDTO;
 import interview.guide.modules.knowledgebase.model.KnowledgeBaseStatsDTO;
 import interview.guide.modules.knowledgebase.model.QueryRequest;
 import interview.guide.modules.knowledgebase.model.QueryResponse;
+import interview.guide.modules.knowledgebase.model.RagEvaluationRequest;
+import interview.guide.modules.knowledgebase.model.RagEvaluationResponse;
 import interview.guide.modules.knowledgebase.model.VectorStatus;
 import interview.guide.modules.knowledgebase.service.KnowledgeBaseDeleteService;
 import interview.guide.modules.knowledgebase.service.KnowledgeBaseListService;
 import interview.guide.modules.knowledgebase.service.KnowledgeBaseQueryService;
 import interview.guide.modules.knowledgebase.service.KnowledgeBaseUploadService;
+import interview.guide.modules.knowledgebase.service.RagEvaluationService;
 import jakarta.validation.Valid;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -45,6 +48,7 @@ public class KnowledgeBaseController {
 
     private final KnowledgeBaseUploadService uploadService;
     private final KnowledgeBaseQueryService queryService;
+    private final RagEvaluationService ragEvaluationService;
     private final KnowledgeBaseListService listService;
     private final KnowledgeBaseDeleteService deleteService;
 
@@ -100,6 +104,16 @@ public class KnowledgeBaseController {
     /**
      * 基于知识库回答问题（流式SSE，支持多知识库）
      */
+
+    /**
+     * RAG 评测：基于标准证据和可选标准答案计算检索、生成和工程指标。
+     */
+    @PostMapping("/api/knowledgebase/evaluation/rag")
+    @RateLimit(dimension = RateLimit.Dimension.GLOBAL, count = 5)
+    @RateLimit(dimension = RateLimit.Dimension.IP, count = 5)
+    public Result<RagEvaluationResponse> evaluateRag(@Valid @RequestBody RagEvaluationRequest request) {
+        return Result.success(ragEvaluationService.evaluate(request));
+    }
     @PostMapping(value = "/api/knowledgebase/query/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     @RateLimit(dimension = RateLimit.Dimension.GLOBAL, count = 5)
     @RateLimit(dimension = RateLimit.Dimension.IP, count = 5)

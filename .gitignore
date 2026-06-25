@@ -1,55 +1,98 @@
-# Ignore Gradle project-specific cache directory
-.gradle
+# ============================================================
+# Local secrets and machine-specific configuration
+# ============================================================
+!.env
+!.env.*
+!.env.example
 
-# Ignore Gradle build output directory
-build
-/.claude
-/.idea
-/.codex-tools
-/app/bin
-# Environment variables
-.env
-test-output.txt
-# IDEA code analysis
-qodana.yaml
-
+app/src/main/resources/application-local.yml
 app/src/main/resources/application-dev.yml
-/docs
-SETUP_API_KEYS.md
+app/src/main/resources/application-secret.yml
+app/src/main/resources/application-prod.yml
 
-# AI Assistant documentation
-CLAUDE.md
-GEMINI.md
-
-# Playwright MCP
+# ============================================================
+# Local tools, installers, and assistant workspaces
+# ============================================================
+.codex-tools/
+.claude/
 .playwright-mcp/
 
-# Frontend dependencies and build output
+# Keep project docs under docs/ tracked. Do not ignore /docs.
+
+# ============================================================
+# Java / Gradle build output
+# ============================================================
+.gradle/
+build/
+app/build/
+app/bin/
+out/
+target/
+
+# ============================================================
+# Frontend dependencies, caches, and build output
+# ============================================================
 frontend/node_modules/
 frontend/dist/
+frontend/build/
 frontend/.vite/
-# Runtime logs and generated temporary files
-tmp/
+frontend/.turbo/
+frontend/.cache/
+frontend/.eslintcache
+
+# ============================================================
+# Runtime logs, temporary files, and generated local output
+# ============================================================
 logs/
+tmp/
+temp/
 *.log
+*.log.*
 *.pid
 *.tmp
 *.temp
-# Local IDE/editor files
-.vscode/
-*.iml
-# OS files
-.DS_Store
-Thumbs.db
-# Local application configs and secrets
-.env.*
-!.env.example
-app/src/main/resources/application-local.yml
-app/src/main/resources/application-secret.yml
-app/src/main/resources/application-prod.yml
-# Local service data / uploaded files
+test-output.txt
+
+# ============================================================
+# Local uploaded files and service data volumes
+# ============================================================
 uploads/
 data/
 rustfs-data/
 postgres-data/
 redis-data/
+
+docker/data/
+docker/logs/
+docker/postgres-data/
+docker/redis-data/
+docker/rustfs-data/
+
+# ============================================================
+# IDE, editor, and OS metadata
+# ============================================================
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Tool reports and local analysis output
+# ============================================================
+qodana.yaml
+.qodana/
+coverage/
+.nyc_output/
+
+# ============================================================
+# Package manager logs
+# ============================================================
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

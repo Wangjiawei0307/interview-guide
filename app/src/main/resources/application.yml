@@ -168,6 +168,15 @@ app:
         topk-long: ${APP_AI_RAG_TOPK_LONG:8}
         min-score-short: ${APP_AI_RAG_MIN_SCORE_SHORT:0.18}
         min-score-default: ${APP_AI_RAG_MIN_SCORE_DEFAULT:0.28}
+      rerank:
+        enabled: ${APP_AI_RAG_RERANK_ENABLED:true}
+        final-topk-short: ${APP_AI_RAG_RERANK_FINAL_TOPK_SHORT:6}
+        final-topk-medium: ${APP_AI_RAG_RERANK_FINAL_TOPK_MEDIUM:5}
+        final-topk-long: ${APP_AI_RAG_RERANK_FINAL_TOPK_LONG:4}
+        vector-weight: ${APP_AI_RAG_RERANK_VECTOR_WEIGHT:0.45}
+        keyword-weight: ${APP_AI_RAG_RERANK_KEYWORD_WEIGHT:0.35}
+        metadata-weight: ${APP_AI_RAG_RERANK_METADATA_WEIGHT:0.15}
+        phrase-weight: ${APP_AI_RAG_RERANK_PHRASE_WEIGHT:0.05}
   interview:
     follow-up-count: ${APP_INTERVIEW_FOLLOW_UP_COUNT:1}
     evaluation:
