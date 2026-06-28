@@ -30,6 +30,18 @@ public class KnowledgeBaseEntity {
     @Column(length = 100)
     private String category;
 
+    @Column(length = 128)
+    private String ownerId = "anonymous";
+
+    @Column(length = 20)
+    private String acl = "PUBLIC";
+
+    @Column(length = 1000)
+    private String aclUsers;
+
+    @Column(length = 1000)
+    private String aclRoles;
+
     // 原始文件名
     @Column(nullable = false)
     private String originalFilename;
@@ -78,6 +90,26 @@ public class KnowledgeBaseEntity {
         uploadedAt = LocalDateTime.now();
         lastAccessedAt = LocalDateTime.now();
         accessCount = 1;
+        ensureAclDefaults();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        ensureAclDefaults();
+    }
+
+    @PostLoad
+    protected void onLoad() {
+        ensureAclDefaults();
+    }
+
+    private void ensureAclDefaults() {
+        if (ownerId == null || ownerId.isBlank()) {
+            ownerId = "anonymous";
+        }
+        if (acl == null || acl.isBlank()) {
+            acl = "PUBLIC";
+        }
     }
     
     // Getters and Setters
@@ -195,6 +227,38 @@ public class KnowledgeBaseEntity {
         this.category = category;
     }
 
+
+    public String getOwnerId() {
+        return ownerId;
+    }
+
+    public void setOwnerId(String ownerId) {
+        this.ownerId = ownerId;
+    }
+
+    public String getAcl() {
+        return acl;
+    }
+
+    public void setAcl(String acl) {
+        this.acl = acl;
+    }
+
+    public String getAclUsers() {
+        return aclUsers;
+    }
+
+    public void setAclUsers(String aclUsers) {
+        this.aclUsers = aclUsers;
+    }
+
+    public String getAclRoles() {
+        return aclRoles;
+    }
+
+    public void setAclRoles(String aclRoles) {
+        this.aclRoles = aclRoles;
+    }
     public VectorStatus getVectorStatus() {
         return vectorStatus;
     }

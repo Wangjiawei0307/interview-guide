@@ -56,17 +56,20 @@ public class KnowledgeBaseVectorService {
     private final VectorRepository vectorRepository;
     private final KnowledgeBaseRepository knowledgeBaseRepository;
     private final KnowledgeDocumentPayloadCodec documentPayloadCodec;
+    private final KnowledgeBaseAccessService accessService;
 
     public KnowledgeBaseVectorService(
         VectorStore vectorStore,
         VectorRepository vectorRepository,
         KnowledgeBaseRepository knowledgeBaseRepository,
-        KnowledgeDocumentPayloadCodec documentPayloadCodec
+        KnowledgeDocumentPayloadCodec documentPayloadCodec,
+        KnowledgeBaseAccessService accessService
     ) {
         this.vectorStore = vectorStore;
         this.vectorRepository = vectorRepository;
         this.knowledgeBaseRepository = knowledgeBaseRepository;
         this.documentPayloadCodec = documentPayloadCodec;
+        this.accessService = accessService;
     }
 
     /**
@@ -126,7 +129,7 @@ public class KnowledgeBaseVectorService {
         try {
             SearchRequest.Builder builder = SearchRequest.builder()
                 .query(query)
-                .topK(Math.max(topK, 1));
+                .topK(Math.max(topK * 3, 1));
 
             if (minScore > 0) {
                 builder.similarityThreshold(minScore);
@@ -142,6 +145,7 @@ public class KnowledgeBaseVectorService {
             }
 
             List<Document> limitedResults = results.stream()
+                .filter(accessService::canReadDocument)
                 .limit(topK)
                 .collect(Collectors.toList());
 
@@ -161,6 +165,14 @@ public class KnowledgeBaseVectorService {
      */
     private List<Document> buildChunkDocuments(Long knowledgeBaseId, ParsedKnowledgeDocument parsedDocument) {
         List<Document> documents = new ArrayList<>();
+        Map<String, String> aclMetadata = knowledgeBaseRepository.findById(knowledgeBaseId)
+            .map(accessService::buildAclMetadata)
+            .orElseGet(() -> Map.of(
+                KnowledgeBaseAccessService.META_ACL, "PUBLIC",
+                KnowledgeBaseAccessService.META_OWNER_ID, "anonymous",
+                KnowledgeBaseAccessService.META_READ_USERS, "",
+                KnowledgeBaseAccessService.META_READ_ROLES, ""
+            ));
         int blockIndex = 0;
         int chunkIndex = 0;
 
@@ -177,6 +189,7 @@ public class KnowledgeBaseVectorService {
             baseMetadata.putIfAbsent("original_filename", parsedDocument.originalFilename());
             baseMetadata.put("block_type", block.type().name().toLowerCase());
             baseMetadata.put("parent_block_index", String.valueOf(blockIndex));
+            baseMetadata.putAll(aclMetadata);
 
             if (block.type() == ParsedDocumentBlock.BlockType.TABLE) {
                 // 表格不做普通文本切分，避免表头和数据行分离后破坏字段关系。
@@ -371,10 +384,12 @@ public class KnowledgeBaseVectorService {
             if (knowledgeBaseIds != null && !knowledgeBaseIds.isEmpty()) {
                 allResults = allResults.stream()
                     .filter(doc -> isDocInKnowledgeBases(doc, knowledgeBaseIds))
+                    .filter(accessService::canReadDocument)
                     .collect(Collectors.toList());
             }
 
             List<Document> results = allResults.stream()
+                .filter(accessService::canReadDocument)
                 .limit(topK)
                 .collect(Collectors.toList());
 

@@ -169,8 +169,11 @@ public class KnowledgeBaseController {
     public Result<Map<String, Object>> uploadKnowledgeBase(
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "name", required = false) String name,
-            @RequestParam(value = "category", required = false) String category) {
-        return Result.success(uploadService.uploadKnowledgeBase(file, name, category));
+            @RequestParam(value = "category", required = false) String category,
+            @RequestParam(value = "acl", required = false) String acl,
+            @RequestParam(value = "aclUsers", required = false) String aclUsers,
+            @RequestParam(value = "aclRoles", required = false) String aclRoles) {
+        return Result.success(uploadService.uploadKnowledgeBase(file, name, category, acl, aclUsers, aclRoles));
     }
 
     /**

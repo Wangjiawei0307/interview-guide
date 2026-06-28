@@ -47,6 +47,7 @@ public class KnowledgeBaseQueryService {
     private final KnowledgeBaseRerankService rerankService;
     private final KnowledgeBaseListService listService;
     private final KnowledgeBaseCountService countService;
+    private final KnowledgeBaseAccessService accessService;
     private final PromptTemplate systemPromptTemplate;
     private final PromptTemplate userPromptTemplate;
     private final PromptTemplate rewritePromptTemplate;
@@ -69,6 +70,7 @@ public class KnowledgeBaseQueryService {
         KnowledgeBaseRerankService rerankService,
         KnowledgeBaseListService listService,
         KnowledgeBaseCountService countService,
+        KnowledgeBaseAccessService accessService,
         KnowledgeBaseQueryProperties queryProperties,
         ResourceLoader resourceLoader
     ) throws IOException {
@@ -77,6 +79,7 @@ public class KnowledgeBaseQueryService {
         this.rerankService = rerankService;
         this.listService = listService;
         this.countService = countService;
+        this.accessService = accessService;
         this.systemPromptTemplate = new PromptTemplate(
             resourceLoader.getResource(queryProperties.getSystemPromptPath())
                 .getContentAsString(StandardCharsets.UTF_8)
@@ -113,10 +116,11 @@ public class KnowledgeBaseQueryService {
             return NO_RESULT_RESPONSE;
         }
 
-        countService.updateQuestionCounts(knowledgeBaseIds);
+        List<Long> readableIds = accessService.filterReadableIds(knowledgeBaseIds);
+        countService.updateQuestionCounts(readableIds);
 
         QueryContext queryContext = buildQueryContext(question, List.of());
-        List<Document> relevantDocs = retrieveRelevantDocs(queryContext, knowledgeBaseIds);
+        List<Document> relevantDocs = retrieveRelevantDocs(queryContext, readableIds);
         if (!hasEffectiveHit(relevantDocs)) {
             return NO_RESULT_RESPONSE;
         }
@@ -141,10 +145,11 @@ public class KnowledgeBaseQueryService {
     }
 
     public QueryResponse queryKnowledgeBase(QueryRequest request) {
-        String answer = answerQuestion(request.knowledgeBaseIds(), request.question());
-        List<String> kbNames = listService.getKnowledgeBaseNames(request.knowledgeBaseIds());
+        List<Long> readableIds = accessService.filterReadableIds(request.knowledgeBaseIds());
+        String answer = answerQuestion(readableIds, request.question());
+        List<String> kbNames = listService.getKnowledgeBaseNames(readableIds);
         String kbNamesStr = String.join("、", kbNames);
-        Long primaryKbId = request.knowledgeBaseIds().getFirst();
+        Long primaryKbId = readableIds.getFirst();
         return new QueryResponse(answer, primaryKbId, kbNamesStr);
     }
 
@@ -160,11 +165,12 @@ public class KnowledgeBaseQueryService {
         }
 
         try {
-            countService.updateQuestionCounts(knowledgeBaseIds);
+            List<Long> readableIds = accessService.filterReadableIds(knowledgeBaseIds);
+            countService.updateQuestionCounts(readableIds);
 
             List<Message> effectiveHistory = sanitizeHistory(history);
             QueryContext queryContext = buildQueryContext(question, effectiveHistory);
-            List<Document> relevantDocs = retrieveRelevantDocs(queryContext, knowledgeBaseIds);
+            List<Document> relevantDocs = retrieveRelevantDocs(queryContext, readableIds);
             if (!hasEffectiveHit(relevantDocs)) {
                 return Flux.just(NO_RESULT_RESPONSE);
             }

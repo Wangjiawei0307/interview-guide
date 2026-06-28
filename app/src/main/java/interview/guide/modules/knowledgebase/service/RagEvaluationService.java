@@ -34,17 +34,20 @@ public class RagEvaluationService {
     private final KnowledgeBaseRerankService rerankService;
     private final KnowledgeBaseQueryService queryService;
     private final KnowledgeBaseQueryProperties queryProperties;
+    private final KnowledgeBaseAccessService accessService;
 
     public RagEvaluationService(
         KnowledgeBaseVectorService vectorService,
         KnowledgeBaseRerankService rerankService,
         KnowledgeBaseQueryService queryService,
-        KnowledgeBaseQueryProperties queryProperties
+        KnowledgeBaseQueryProperties queryProperties,
+        KnowledgeBaseAccessService accessService
     ) {
         this.vectorService = vectorService;
         this.rerankService = rerankService;
         this.queryService = queryService;
         this.queryProperties = queryProperties;
+        this.accessService = accessService;
     }
 
     public RagEvaluationResponse evaluate(RagEvaluationRequest request) {
@@ -52,11 +55,12 @@ public class RagEvaluationService {
         int topK = resolveTopK(request.topK());
         int candidateTopK = Math.max(queryProperties.getSearch().getTopkMedium(), topK * 3);
         double minScore = queryProperties.getSearch().getMinScoreDefault();
+        List<Long> readableIds = accessService.filterReadableIds(request.knowledgeBaseIds());
 
         long retrievalStart = System.nanoTime();
         List<Document> candidates = vectorService.similaritySearch(
             request.question(),
-            request.knowledgeBaseIds(),
+            readableIds,
             candidateTopK,
             minScore
         );
@@ -70,7 +74,7 @@ public class RagEvaluationService {
         String answer = normalize(request.answer());
         if (answer.isBlank() && Boolean.TRUE.equals(request.generateAnswer())) {
             long generationStart = System.nanoTime();
-            answer = queryService.answerQuestion(request.knowledgeBaseIds(), request.question());
+            answer = queryService.answerQuestion(readableIds, request.question());
             generationLatencyMs = elapsedMs(generationStart);
         }
 
@@ -109,7 +113,7 @@ public class RagEvaluationService {
         );
 
         log.info("RAG evaluation completed: kbIds={}, topK={}, overallScore={}",
-            request.knowledgeBaseIds(), topK, overallScore);
+            readableIds, topK, overallScore);
         return new RagEvaluationResponse(
             request.question(),
             answer,

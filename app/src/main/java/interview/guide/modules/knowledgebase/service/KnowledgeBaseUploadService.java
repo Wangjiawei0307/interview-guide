@@ -2,6 +2,7 @@ package interview.guide.modules.knowledgebase.service;
 
 import interview.guide.common.exception.BusinessException;
 import interview.guide.common.exception.ErrorCode;
+import interview.guide.common.security.CurrentUserContext;
 import interview.guide.infrastructure.file.FileHashService;
 import interview.guide.infrastructure.file.FileStorageService;
 import interview.guide.infrastructure.file.FileValidationService;
@@ -15,6 +16,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -33,13 +35,22 @@ public class KnowledgeBaseUploadService {
     private final FileHashService fileHashService;
     private final VectorizeStreamProducer vectorizeStreamProducer;
     private final KnowledgeDocumentPayloadCodec documentPayloadCodec;
+    private final KnowledgeBaseAccessService accessService;
 
-    public Map<String, Object> uploadKnowledgeBase(MultipartFile file, String name, String category) {
+    public Map<String, Object> uploadKnowledgeBase(
+        MultipartFile file,
+        String name,
+        String category,
+        String acl,
+        String aclUsers,
+        String aclRoles
+    ) {
         fileValidationService.validateFile(file, MAX_FILE_SIZE, "知识库");
+        CurrentUserContext currentUser = accessService.currentUser();
 
         String fileName = file.getOriginalFilename();
-        log.info("Received knowledge base upload: fileName={}, size={}, category={}",
-            fileName, file.getSize(), category);
+        log.info("Received knowledge base upload: fileName={}, size={}, category={}, ownerId={}, acl={}",
+            fileName, file.getSize(), category, currentUser.userId(), acl);
 
         String contentType = parseService.detectContentType(file);
         validateContentType(contentType, fileName);
@@ -47,8 +58,12 @@ public class KnowledgeBaseUploadService {
         String fileHash = fileHashService.calculateHash(file);
         Optional<KnowledgeBaseEntity> existingKb = knowledgeBaseRepository.findByFileHash(fileHash);
         if (existingKb.isPresent()) {
-            log.info("Duplicate knowledge base detected: hash={}", fileHash);
-            return persistenceService.handleDuplicateKnowledgeBase(existingKb.get(), fileHash);
+            KnowledgeBaseEntity existing = existingKb.get();
+            if (!accessService.canRead(existing, currentUser)) {
+                throw new BusinessException(ErrorCode.FORBIDDEN, "该文件已存在，但当前用户无权访问已有知识库");
+            }
+            log.info("Duplicate knowledge base detected: hash={}, kbId={}", fileHash, existing.getId());
+            return persistenceService.handleDuplicateKnowledgeBase(existing, fileHash);
         }
 
         ParsedKnowledgeDocument document = parseService.parseKnowledgeDocument(file);
@@ -62,23 +77,38 @@ public class KnowledgeBaseUploadService {
         log.info("Knowledge base file stored: storageKey={}", fileKey);
 
         KnowledgeBaseEntity savedKb = persistenceService.saveKnowledgeBase(
-            file, name, category, fileKey, fileUrl, fileHash);
+            file,
+            name,
+            category,
+            fileKey,
+            fileUrl,
+            fileHash,
+            currentUser.userId(),
+            acl,
+            aclUsers,
+            aclRoles
+        );
 
         vectorizeStreamProducer.sendVectorizeTask(savedKb.getId(), vectorPayload);
 
         log.info("Knowledge base upload completed, vector task queued: fileName={}, kbId={}, blocks={}",
             fileName, savedKb.getId(), document.blocks().size());
 
+        Map<String, Object> knowledgeBase = new LinkedHashMap<>();
+        knowledgeBase.put("id", savedKb.getId());
+        knowledgeBase.put("name", savedKb.getName());
+        knowledgeBase.put("category", savedKb.getCategory() != null ? savedKb.getCategory() : "");
+        knowledgeBase.put("ownerId", savedKb.getOwnerId());
+        knowledgeBase.put("acl", savedKb.getAcl());
+        knowledgeBase.put("aclUsers", savedKb.getAclUsers() != null ? savedKb.getAclUsers() : "");
+        knowledgeBase.put("aclRoles", savedKb.getAclRoles() != null ? savedKb.getAclRoles() : "");
+        knowledgeBase.put("fileSize", savedKb.getFileSize());
+        knowledgeBase.put("contentLength", document.indexableLength());
+        knowledgeBase.put("blockCount", document.blocks().size());
+        knowledgeBase.put("vectorStatus", VectorStatus.PENDING.name());
+
         return Map.of(
-            "knowledgeBase", Map.of(
-                "id", savedKb.getId(),
-                "name", savedKb.getName(),
-                "category", savedKb.getCategory() != null ? savedKb.getCategory() : "",
-                "fileSize", savedKb.getFileSize(),
-                "contentLength", document.indexableLength(),
-                "blockCount", document.blocks().size(),
-                "vectorStatus", VectorStatus.PENDING.name()
-            ),
+            "knowledgeBase", knowledgeBase,
             "storage", Map.of(
                 "fileKey", fileKey,
                 "fileUrl", fileUrl
@@ -98,8 +128,7 @@ public class KnowledgeBaseUploadService {
     }
 
     public void revectorize(Long kbId) {
-        KnowledgeBaseEntity kb = knowledgeBaseRepository.findById(kbId)
-            .orElseThrow(() -> new BusinessException(ErrorCode.NOT_FOUND, "知识库不存在"));
+        KnowledgeBaseEntity kb = accessService.requireManageable(kbId);
 
         log.info("Start revectorizing knowledge base: kbId={}, name={}", kbId, kb.getName());
 
