@@ -10,7 +10,38 @@ Set-Location $repoRoot
 
 $dockerBin = "C:\Program Files\Docker\Docker\resources\bin"
 $dockerDesktop = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
-$java21Home = Join-Path $env:USERPROFILE ".vscode\extensions\redhat.java-1.54.0-win32-x64\jre\21.0.10-win32-x86_64"
+function Resolve-Java21Home {
+  $candidates = New-Object System.Collections.Generic.List[string]
+
+  $vscodeExtensions = Join-Path $env:USERPROFILE ".vscode\extensions"
+  if (Test-Path $vscodeExtensions) {
+    Get-ChildItem -Path $vscodeExtensions -Directory -Filter "redhat.java-*-win32-x64" -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending |
+      ForEach-Object {
+        $jreRoot = Join-Path $_.FullName "jre"
+        if (Test-Path $jreRoot) {
+          Get-ChildItem -Path $jreRoot -Directory -Filter "21.*" -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { $candidates.Add($_.FullName) }
+        }
+      }
+  }
+
+  $candidates.Add("C:\Program Files\JetBrains\PyCharm 2025.1.2\jbr")
+  $candidates.Add("C:\Program Files\JetBrains\IntelliJ IDEA 2025.1.2\jbr")
+  $candidates.Add("C:\Program Files\Java\jdk-21")
+
+  foreach ($candidate in $candidates) {
+    $javaExe = Join-Path $candidate "bin\java.exe"
+    if (Test-Path $javaExe) {
+      return $candidate
+    }
+  }
+
+  return $null
+}
+
+$java21Home = Resolve-Java21Home
 
 if (Test-Path $dockerBin) {
   $env:PATH = "$dockerBin;$env:PATH"
@@ -24,9 +55,12 @@ if (-not (Test-Path $dockerConfigFile)) {
 }
 $env:DOCKER_CONFIG = $dockerConfig
 
-if (Test-Path (Join-Path $java21Home "bin\java.exe")) {
+if ($java21Home -and (Test-Path (Join-Path $java21Home "bin\java.exe"))) {
   $env:JAVA_HOME = $java21Home
   $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+  Write-Host "Using JAVA_HOME=$env:JAVA_HOME"
+} else {
+  Write-Warning "JDK 21 was not found. Install JDK 21 or update JAVA_HOME before starting the backend."
 }
 
 function Test-Port {
@@ -85,8 +119,20 @@ if (-not (Test-DockerReady)) {
   Wait-Docker
 }
 
+$redisPort = 6379
+$envFile = Join-Path $repoRoot ".env"
+if (Test-Path $envFile) {
+  $redisPortLine = Get-Content $envFile |
+    Where-Object { $_ -match '^\s*REDIS_PORT\s*=' } |
+    Select-Object -First 1
+  if ($redisPortLine -match '^\s*REDIS_PORT\s*=\s*(\d+)') {
+    $redisPort = [int]$Matches[1]
+  }
+}
+Write-Host "Using REDIS_PORT=$redisPort"
+
 $services = @("postgres", "rustfs")
-if ($WithRedis -or -not (Test-Port 6379)) {
+if ($WithRedis -or -not (Test-Port $redisPort)) {
   $services += "redis"
 }
 
