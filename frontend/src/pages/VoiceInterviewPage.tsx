@@ -24,6 +24,14 @@ type VoiceConfig = {
   llmProvider?: string;
 };
 
+type QueuedAudioChunk = {
+  buffer: AudioBuffer;
+  index: number;
+  isLast: boolean;
+  turnId?: string;
+  text?: string;
+};
+
 export default function VoiceInterviewPage() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -83,10 +91,19 @@ export default function VoiceInterviewPage() {
   const audioPlaybackWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Chunked audio playback refs
   const audioContextRef = useRef<AudioContext | null>(null);
-  const chunkQueueRef = useRef<AudioBuffer[]>([]);
+  const chunkQueueRef = useRef<QueuedAudioChunk[]>([]);
   const isChunkPlayingRef = useRef(false);
   const chunkPlaybackSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const drainCheckRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const aiPlaybackGainRef = useRef<GainNode | null>(null);
+  const audioVolumeAnimationRef = useRef<number | null>(null);
+  const currentAiTurnIdRef = useRef('');
+  const lastPlayedChunkIndexRef = useRef(-1);
+  const playbackCompleteSentRef = useRef(false);
+  const interruptTriggeredRef = useRef(false);
+  const userSpeakingDuringAiRef = useRef(false);
+  const interruptConfirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fullAudioChunkIndexRef = useRef(0);
   // Ref to track latest aiText for async callbacks (avoids stale closure)
   const aiTextRef = useRef('');
   useEffect(() => { aiTextRef.current = aiText; }, [aiText]);
@@ -153,16 +170,12 @@ export default function VoiceInterviewPage() {
     }
   }, []);
 
-  const finishAiPlayback = useCallback(() => {
-    aiAudioPendingRef.current = false;
-    clearAudioPlaybackWatchdog();
-    setAiSpeaking(false);
-    setIsSubmitting(false);
-    clearPendingAiTextCommit();
-    commitAiMessage(aiTextRef.current.trim());
-    setAiText('');
-    setAiAudio('');
-  }, [clearAudioPlaybackWatchdog, clearPendingAiTextCommit, commitAiMessage, setAiSpeaking]);
+  const clearInterruptConfirmTimer = useCallback(() => {
+    if (interruptConfirmTimerRef.current) {
+      clearTimeout(interruptConfirmTimerRef.current);
+      interruptConfirmTimerRef.current = null;
+    }
+  }, []);
 
   // --- Chunked audio playback via AudioContext ---
   const getAudioContext = useCallback(() => {
@@ -171,6 +184,157 @@ export default function VoiceInterviewPage() {
     }
     return audioContextRef.current;
   }, []);
+
+  const rampAudioElementVolume = useCallback((targetVolume: number, durationMs = 140) => {
+    const audio = audioPlayerRef.current;
+    if (!audio) {
+      return;
+    }
+    const target = Math.max(0, Math.min(1, targetVolume));
+    if (audioVolumeAnimationRef.current !== null) {
+      cancelAnimationFrame(audioVolumeAnimationRef.current);
+      audioVolumeAnimationRef.current = null;
+    }
+    const start = audio.volume;
+    const startedAt = performance.now();
+    const tick = (now: number) => {
+      const progress = durationMs <= 0 ? 1 : Math.min(1, (now - startedAt) / durationMs);
+      audio.volume = start + (target - start) * progress;
+      if (progress < 1) {
+        audioVolumeAnimationRef.current = requestAnimationFrame(tick);
+      } else {
+        audioVolumeAnimationRef.current = null;
+      }
+    };
+    audioVolumeAnimationRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  const getAiPlaybackGain = useCallback(() => {
+    const ctx = getAudioContext();
+    if (!aiPlaybackGainRef.current || aiPlaybackGainRef.current.context !== ctx) {
+      const gain = ctx.createGain();
+      gain.gain.value = 1;
+      gain.connect(ctx.destination);
+      aiPlaybackGainRef.current = gain;
+    }
+    return aiPlaybackGainRef.current;
+  }, [getAudioContext]);
+
+  const setAiOutputVolume = useCallback((targetVolume: number, durationMs = 140) => {
+    const target = Math.max(0, Math.min(1, targetVolume));
+    try {
+      const gain = getAiPlaybackGain();
+      const now = gain.context.currentTime;
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(gain.gain.value, now);
+      gain.gain.linearRampToValueAtTime(target, now + durationMs / 1000);
+    } catch (error) {
+      console.warn('[VoiceInterrupt] Failed to ramp chunk volume:', error);
+    }
+    rampAudioElementVolume(target, durationMs);
+  }, [getAiPlaybackGain, rampAudioElementVolume]);
+
+  const restoreAiVolume = useCallback(() => {
+    setAiOutputVolume(1, 180);
+  }, [setAiOutputVolume]);
+
+  const duckAiVolume = useCallback(() => {
+    setAiOutputVolume(0.18, 180);
+  }, [setAiOutputVolume]);
+
+  const muteAiVolume = useCallback(() => {
+    setAiOutputVolume(0, 100);
+  }, [setAiOutputVolume]);
+
+  const clearChunkDrainCheck = useCallback(() => {
+    if (drainCheckRef.current) {
+      clearInterval(drainCheckRef.current);
+      drainCheckRef.current = null;
+    }
+  }, []);
+
+  const sendPlaybackComplete = useCallback(() => {
+    const turnId = currentAiTurnIdRef.current;
+    if (!turnId || playbackCompleteSentRef.current) {
+      return;
+    }
+    playbackCompleteSentRef.current = true;
+    wsRef.current?.sendControl('playback_complete', {
+      turnId,
+      lastPlayedChunkIndex: lastPlayedChunkIndexRef.current,
+    });
+  }, []);
+
+  const finishAiPlayback = useCallback(() => {
+    sendPlaybackComplete();
+    aiAudioPendingRef.current = false;
+    userSpeakingDuringAiRef.current = false;
+    interruptTriggeredRef.current = false;
+    clearAudioPlaybackWatchdog();
+    clearInterruptConfirmTimer();
+    clearChunkDrainCheck();
+    restoreAiVolume();
+    setAiSpeaking(false);
+    setIsSubmitting(false);
+    clearPendingAiTextCommit();
+    commitAiMessage(aiTextRef.current.trim());
+    setAiText('');
+    setAiAudio('');
+    currentAiTurnIdRef.current = '';
+    lastPlayedChunkIndexRef.current = -1;
+  }, [
+    clearAudioPlaybackWatchdog,
+    clearChunkDrainCheck,
+    clearInterruptConfirmTimer,
+    clearPendingAiTextCommit,
+    commitAiMessage,
+    restoreAiVolume,
+    sendPlaybackComplete,
+    setAiSpeaking,
+  ]);
+
+  const stopAiPlayback = useCallback(() => {
+    clearAudioPlaybackWatchdog();
+    clearPendingAiTextCommit();
+    clearChunkDrainCheck();
+    clearInterruptConfirmTimer();
+    if (chunkPlaybackSourceRef.current) {
+      try {
+        chunkPlaybackSourceRef.current.onended = null;
+        chunkPlaybackSourceRef.current.stop();
+      } catch {
+        // Source may already be stopped.
+      }
+      chunkPlaybackSourceRef.current = null;
+    }
+    chunkQueueRef.current = [];
+    isChunkPlayingRef.current = false;
+    const audio = audioPlayerRef.current;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+    }
+    aiAudioPendingRef.current = false;
+    setAiSpeaking(false);
+    setIsSubmitting(false);
+    setAiAudio('');
+    setAiText('');
+  }, [clearAudioPlaybackWatchdog, clearChunkDrainCheck, clearInterruptConfirmTimer, clearPendingAiTextCommit, setAiSpeaking]);
+
+  const activateAiTurn = useCallback((turnId?: string) => {
+    if (!turnId) {
+      return;
+    }
+    if (currentAiTurnIdRef.current !== turnId) {
+      currentAiTurnIdRef.current = turnId;
+      lastPlayedChunkIndexRef.current = -1;
+      playbackCompleteSentRef.current = false;
+      interruptTriggeredRef.current = false;
+      userSpeakingDuringAiRef.current = false;
+      clearInterruptConfirmTimer();
+      restoreAiVolume();
+    }
+  }, [clearInterruptConfirmTimer, restoreAiVolume]);
 
   const playNextChunk = useCallback(() => {
     if (chunkQueueRef.current.length === 0) {
@@ -182,44 +346,68 @@ export default function VoiceInterviewPage() {
     if (ctx.state === 'suspended') {
       ctx.resume();
     }
-    const buffer = chunkQueueRef.current.shift()!;
+    const chunk = chunkQueueRef.current.shift()!;
+    if (chunk.turnId && currentAiTurnIdRef.current !== chunk.turnId) {
+      currentAiTurnIdRef.current = chunk.turnId;
+      lastPlayedChunkIndexRef.current = -1;
+      playbackCompleteSentRef.current = false;
+      interruptTriggeredRef.current = false;
+    }
     const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
+    source.buffer = chunk.buffer;
+    source.connect(getAiPlaybackGain());
     chunkPlaybackSourceRef.current = source;
     source.onended = () => {
       chunkPlaybackSourceRef.current = null;
+      if (!interruptTriggeredRef.current && (!chunk.turnId || chunk.turnId === currentAiTurnIdRef.current)) {
+        lastPlayedChunkIndexRef.current = Math.max(lastPlayedChunkIndexRef.current, chunk.index);
+      }
       playNextChunk();
     };
     source.start(0);
-  }, [getAudioContext]);
+  }, [getAiPlaybackGain, getAudioContext]);
 
   const scheduleChunkDrainCompletion = useCallback(() => {
     const startedAt = Date.now();
     const maxDrainWaitMs = 30_000;
-    if (drainCheckRef.current) {
-      clearInterval(drainCheckRef.current);
-    }
+    clearChunkDrainCheck();
     drainCheckRef.current = setInterval(() => {
       if (chunkQueueRef.current.length === 0 && !isChunkPlayingRef.current) {
-        clearInterval(drainCheckRef.current!);
-        drainCheckRef.current = null;
+        clearChunkDrainCheck();
+        sendPlaybackComplete();
+        restoreAiVolume();
         setAiSpeaking(false);
         setIsSubmitting(false);
         clearPendingAiTextCommit();
         commitAiMessage(aiTextRef.current.trim());
         setAiText('');
+        currentAiTurnIdRef.current = '';
+        lastPlayedChunkIndexRef.current = -1;
       } else if (Date.now() - startedAt > maxDrainWaitMs) {
-        clearInterval(drainCheckRef.current!);
-        drainCheckRef.current = null;
+        clearChunkDrainCheck();
+        restoreAiVolume();
         setAiSpeaking(false);
         setIsSubmitting(false);
       }
     }, 100);
-  }, [clearPendingAiTextCommit, commitAiMessage, setAiSpeaking]);
+  }, [
+    clearChunkDrainCheck,
+    clearPendingAiTextCommit,
+    commitAiMessage,
+    restoreAiVolume,
+    sendPlaybackComplete,
+    setAiSpeaking,
+  ]);
 
-  const handleAudioChunk = useCallback((base64Wav: string, _index: number, isLast: boolean) => {
+  const handleAudioChunk = useCallback((
+    base64Wav: string,
+    index: number,
+    isLast: boolean,
+    turnId?: string,
+    text?: string
+  ) => {
     try {
+      activateAiTurn(turnId);
       aiAudioPendingRef.current = false;
       clearPendingAiTextCommit();
       const binaryStr = atob(base64Wav);
@@ -238,7 +426,7 @@ export default function VoiceInterviewPage() {
       const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
       audioBuffer.getChannelData(0).set(float32);
 
-      chunkQueueRef.current.push(audioBuffer);
+      chunkQueueRef.current.push({ buffer: audioBuffer, index, isLast, turnId, text });
       if (!isChunkPlayingRef.current) {
         playNextChunk();
       }
@@ -251,7 +439,30 @@ export default function VoiceInterviewPage() {
     } catch (e) {
       console.error('[ChunkAudio] Decode/play error:', e);
     }
-  }, [getAudioContext, playNextChunk, scheduleChunkDrainCompletion, setAiSpeaking]);
+  }, [
+    activateAiTurn,
+    clearPendingAiTextCommit,
+    getAudioContext,
+    playNextChunk,
+    scheduleChunkDrainCompletion,
+    sendPlaybackComplete,
+    setAiSpeaking,
+  ]);
+
+  const triggerInterrupt = useCallback(() => {
+    if (interruptTriggeredRef.current || !isAiSpeakingRef.current) {
+      return;
+    }
+    interruptTriggeredRef.current = true;
+    clearInterruptConfirmTimer();
+    muteAiVolume();
+    wsRef.current?.sendControl('interrupt', {
+      reason: 'user_barge_in',
+      turnId: currentAiTurnIdRef.current,
+      lastPlayedChunkIndex: lastPlayedChunkIndexRef.current,
+    });
+    setTimeout(stopAiPlayback, 120);
+  }, [clearInterruptConfirmTimer, muteAiVolume, stopAiPlayback]);
 
   // Load skills for template name display
   useEffect(() => {
@@ -348,7 +559,7 @@ export default function VoiceInterviewPage() {
     if (!userText.trim() || isAiSpeakingRef.current || isSubmitting) {
       return;
     }
-    setIsRecording(false);
+    // Keep recorder active so VAD can detect user barge-in while AI is speaking.
     setIsSubmitting(true);
     const text = userText.trim();
     setMessages(prev => [
@@ -383,9 +594,15 @@ export default function VoiceInterviewPage() {
         setUserText(text);
       }
     },
-    onAudioResponse: (audioData: string, text: string) => {
+    onAudioResponse: (audioData: string, text: string, turnId?: string, index?: number) => {
+      activateAiTurn(turnId);
       const hasAudio = !!(audioData && audioData.length > 0);
       const normalized = (text || '').trim();
+      if (typeof index === 'number') {
+        fullAudioChunkIndexRef.current = index;
+      } else {
+        fullAudioChunkIndexRef.current = 0;
+      }
       if (hasAudio) {
         clearPendingAiTextCommit();
         clearAudioPlaybackWatchdog();
@@ -404,18 +621,21 @@ export default function VoiceInterviewPage() {
       setAiText(normalized);
       setAiSpeaking(false);
       if (!normalized) {
+        sendPlaybackComplete();
         setIsSubmitting(false);
         return;
       }
       clearPendingAiTextCommit();
       pendingAiTextCommitRef.current = setTimeout(() => {
+        sendPlaybackComplete();
         commitAiMessage(normalized);
         setIsSubmitting(false);
         setAiSpeaking(false);
         pendingAiTextCommitRef.current = null;
       }, 2500);
     },
-    onTextResponse: (text: string, isFinal: boolean) => {
+    onTextResponse: (text: string, isFinal: boolean, turnId?: string) => {
+      activateAiTurn(turnId);
       const normalized = (text || '').trim();
       if (!normalized) {
         return;
@@ -432,6 +652,7 @@ export default function VoiceInterviewPage() {
         if (aiAudioPendingRef.current) {
           aiAudioPendingRef.current = false;
         }
+        sendPlaybackComplete();
         commitAiMessage(normalized);
         setIsSubmitting(false);
         setAiSpeaking(false);
@@ -453,10 +674,14 @@ export default function VoiceInterviewPage() {
       setConnectionStatus('disconnected');
       setIsAsrReady(false);
     },
-    onAudioChunk: (data: string, index: number, isLast: boolean) => {
-      handleAudioChunk(data, index, isLast);
+    onAudioChunk: (data: string, index: number, isLast: boolean, turnId?: string, text?: string) => {
+      handleAudioChunk(data, index, isLast, turnId, text);
     },
-    onControl: (action: string, message?: string) => {
+    onControl: (action: string, message?: string, turnId?: string) => {
+      if (action === 'ai_turn_start') {
+        activateAiTurn(turnId);
+        return;
+      }
       if (action === 'asr_ready') {
         setIsAsrReady(true);
         setError(null);
@@ -470,7 +695,12 @@ export default function VoiceInterviewPage() {
         return;
       }
       if (action === 'audio_complete') {
+        activateAiTurn(turnId);
         scheduleChunkDrainCompletion();
+        return;
+      }
+      if (action === 'interrupt_ack') {
+        setIsSubmitting(false);
         return;
       }
       if (action === 'pause_timeout_warning' && message) {
@@ -490,6 +720,7 @@ export default function VoiceInterviewPage() {
       }
     },
   }), [
+    activateAiTurn,
     clearAudioPlaybackWatchdog,
     clearPendingAiTextCommit,
     commitAiMessage,
@@ -497,6 +728,7 @@ export default function VoiceInterviewPage() {
     finishAiPlayback,
     handleAudioChunk,
     scheduleChunkDrainCompletion,
+    sendPlaybackComplete,
     setAiSpeaking,
   ]);
 
@@ -650,8 +882,27 @@ export default function VoiceInterviewPage() {
     }
   };
 
-  const handleSpeechStart = () => {};
-  const handleSpeechEnd = () => {};
+  const handleSpeechStart = useCallback(() => {
+    if (!isAiSpeakingRef.current || interruptTriggeredRef.current) {
+      return;
+    }
+    userSpeakingDuringAiRef.current = true;
+    duckAiVolume();
+    clearInterruptConfirmTimer();
+    interruptConfirmTimerRef.current = setTimeout(() => {
+      if (userSpeakingDuringAiRef.current && isAiSpeakingRef.current) {
+        triggerInterrupt();
+      }
+    }, 450);
+  }, [clearInterruptConfirmTimer, duckAiVolume, triggerInterrupt]);
+
+  const handleSpeechEnd = useCallback(() => {
+    userSpeakingDuringAiRef.current = false;
+    if (!interruptTriggeredRef.current) {
+      clearInterruptConfirmTimer();
+      restoreAiVolume();
+    }
+  }, [clearInterruptConfirmTimer, restoreAiVolume]);
 
   const handlePause = async (type: 'short' | 'long') => {
     if (!sessionId) return;
@@ -925,6 +1176,12 @@ export default function VoiceInterviewPage() {
           ref={audioPlayerRef}
           src={`data:audio/wav;base64,${aiAudio}`}
           onEnded={() => {
+            if (currentAiTurnIdRef.current) {
+              lastPlayedChunkIndexRef.current = Math.max(
+                lastPlayedChunkIndexRef.current,
+                fullAudioChunkIndexRef.current
+              );
+            }
             finishAiPlayback();
           }}
           onPlay={() => setAiSpeaking(true)}

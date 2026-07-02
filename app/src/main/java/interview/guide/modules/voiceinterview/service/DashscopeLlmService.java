@@ -12,6 +12,7 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -90,6 +91,9 @@ public class DashscopeLlmService {
                 .stream()
                 .content()
                 .doOnNext(token -> {
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new CancellationException("LLM stream interrupted");
+                    }
                     if (token == null || token.isEmpty()) {
                         return;
                     }
@@ -148,6 +152,9 @@ public class DashscopeLlmService {
             log.info("LLM sentence stream response for session {}: {}", session.getId(),
                 optimized.substring(0, Math.min(100, optimized.length())));
             return optimized;
+        } catch (CancellationException e) {
+            log.info("LLM sentence stream cancelled for session {}", session.getId());
+            return "";
         } catch (Exception e) {
             log.error("LLM sentence stream error for session {}: {}", session.getId(), e.getMessage(), e);
             return mapLlmErrorToUserMessage(e);

@@ -27,9 +27,12 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -76,6 +79,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
 
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, SessionState> sessionStates = new ConcurrentHashMap<>();
+    private final Map<String, ActiveAiTurn> activeAiTurns = new ConcurrentHashMap<>();
     private final Map<String, byte[]> openingAudioCache = new ConcurrentHashMap<>();
 
     // Activity tracking for pause timeout
@@ -236,14 +240,15 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                     return;
                 }
 
-                // 先落库再推前端，确保用户提交时 DB 中已有该条消息
-                saveMessage(sessionId, null, aiReply);
-                sendTextMessage(session, aiReply, true);
+                ActiveAiTurn aiTurn = startAiTurn(sessionId, session, null);
+                aiTurn.setFullText(aiReply);
+                sendTextMessage(session, aiReply, true, aiTurn.turnId());
 
-                // 语音随后下发
+                // 语音随后下发，播放完成后再落库，避免被打断时记录未播放内容。
                 byte[] wavAudio = getOpeningWavAudio(aiReply);
                 if (wavAudio.length > 0 && session.isOpen()) {
-                    sendAudio(session, wavAudio, aiReply);
+                    aiTurn.replaceWithSingleChunk(aiReply);
+                    sendAudio(session, wavAudio, aiReply, aiTurn.turnId(), 0);
                 }
 
                 log.info("Opening question sent for session {}", sessionId);
@@ -368,6 +373,10 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         String sessionId = extractSessionId(session);
         try {
             sessions.remove(sessionId);
+            ActiveAiTurn removedTurn = activeAiTurns.remove(sessionId);
+            if (removedTurn != null) {
+                removedTurn.cancel();
+            }
             SessionState removedState = sessionStates.remove(sessionId);
             if (removedState != null) {
                 Thread t = removedState.getProcessingThread();
@@ -640,6 +649,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
             }
 
             List<String> conversationHistory = getHistory(sessionId);
+            ActiveAiTurn aiTurn = startAiTurn(sessionId, session, userText);
 
             long llmStartNanos = System.nanoTime();
             AtomicLong firstTokenAtNanos = new AtomicLong(0);
@@ -653,14 +663,14 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 boolean chunkedEnabled = voiceInterviewProperties.isChunkedAudioEnabled();
                 long ttsTimeoutSec = Math.max(5, voiceInterviewProperties.getTtsTimeoutSeconds());
                 OrderedTtsChunkEmitter chunkEmitter = chunkedEnabled
-                    ? new OrderedTtsChunkEmitter(sessionId, session, ttsSemaphore, ttsTimeoutSec)
+                    ? new OrderedTtsChunkEmitter(sessionId, session, ttsSemaphore, ttsTimeoutSec, aiTurn)
                     : null;
                 List<CompletableFuture<byte[]>> ttsFutures = new ArrayList<>();
 
                 aiReply = llmService.chatStreamSentences(
                     userText,
                     partialText -> {
-                        if (partialText == null || partialText.isBlank() || !session.isOpen()) {
+                        if (partialText == null || partialText.isBlank() || !session.isOpen() || aiTurn.isCancelled()) {
                             return;
                         }
                         if (firstTokenAtNanos.compareAndSet(0L, System.nanoTime())) {
@@ -670,10 +680,10 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                                 "status", "success"
                             );
                         }
-                        sendTextMessage(session, partialText, false);
+                        sendTextMessage(session, partialText, false, aiTurn.turnId());
                     },
                     sentence -> {
-                        if (sentence == null || sentence.isBlank()) {
+                        if (sentence == null || sentence.isBlank() || aiTurn.isCancelled()) {
                             return;
                         }
                         if (chunkEmitter != null) {
@@ -688,6 +698,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                                 ttsSemaphore.release();
                             }
                         }, voicePipelineExecutor);
+                        aiTurn.addFuture(future);
                         ttsFutures.add(future);
                     },
                     sessionEntity,
@@ -697,15 +708,15 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 recordTimerSinceNanos("app.voice.interview.llm.duration", llmStartNanos, "status", "success");
                 incrementCounter("app.voice.interview.llm.calls", "status", "success", "streaming", "true");
                 log.info("LLM response for session {}: '{}'", sessionId, aiReply);
+                aiTurn.setFullText(aiReply);
 
-                if (!session.isOpen()) {
-                    log.warn("WebSocket closed during LLM processing, discarding response for session {}", sessionId);
+                if (!session.isOpen() || aiTurn.isCancelled()) {
+                    log.warn("WebSocket closed or AI turn cancelled during LLM processing, discarding response for session {}", sessionId);
                     return;
                 }
 
                 sendSubtitle(session, userText, true);
-                sendTextMessage(session, aiReply, true);
-                saveMessage(sessionId, userText, aiReply);
+                sendTextMessage(session, aiReply, true, aiTurn.turnId());
 
                 // 按顺序收集所有 TTS 结果（带超时，防止单句 TTS 挂死阻塞整条管道）
                 if (chunkEmitter != null) {
@@ -713,13 +724,14 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                     chunkEmitter.finish();
                     int emittedChunks = chunkEmitter.awaitCompletion();
                     recordTimerSinceNanos("app.voice.interview.tts.duration", ttsStartNanos, "status", "success");
-                    if (emittedChunks == 0 && session.isOpen()) {
+                    if (emittedChunks == 0 && session.isOpen() && !aiTurn.isCancelled()) {
                         log.info("[Session: {}] Streaming TTS produced no chunks, falling back to full-text TTS",
                             sessionId);
                         try {
                             byte[] fallbackPcm = ttsService.synthesize(aiReply);
                             if (fallbackPcm != null && fallbackPcm.length > 0) {
-                                sendAudio(session, convertPcmToWav(fallbackPcm), aiReply);
+                                aiTurn.replaceWithSingleChunk(aiReply);
+                                sendAudio(session, convertPcmToWav(fallbackPcm), aiReply, aiTurn.turnId(), 0);
                             }
                         } catch (Exception e) {
                             log.warn("[Session: {}] Fallback TTS failed: {}", sessionId, e.getMessage());
@@ -747,13 +759,13 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                     }
                     recordTimerSinceNanos("app.voice.interview.tts.duration", ttsStartNanos, "status", "success");
 
-                    if (!session.isOpen()) {
-                        log.warn("WebSocket closed during TTS processing, discarding audio for session {}", sessionId);
+                    if (!session.isOpen() || aiTurn.isCancelled()) {
+                        log.warn("WebSocket closed or AI turn cancelled during TTS processing, discarding audio for session {}", sessionId);
                         return;
                     }
 
                     // 有句子级 TTS 失败且无成功结果时，用完整文本做一次兜底 TTS
-                    if (totalSize == 0 && failedCount > 0 && session.isOpen()) {
+                    if (totalSize == 0 && failedCount > 0 && session.isOpen() && !aiTurn.isCancelled()) {
                         log.info("[Session: {}] All {} sentence TTS calls failed, falling back to full-text TTS",
                             sessionId, failedCount);
                         try {
@@ -762,7 +774,8 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                                 byte[] wavAudio = convertPcmToWav(fallbackPcm);
                                 log.info("[Session: {}] Fallback TTS succeeded, WAV size: {} bytes",
                                     sessionId, wavAudio.length);
-                                sendAudio(session, wavAudio, aiReply);
+                                aiTurn.replaceWithSingleChunk(aiReply);
+                                sendAudio(session, wavAudio, aiReply, aiTurn.turnId(), 0);
                                 audioSentByFallback = true;
                             }
                         } catch (Exception e) {
@@ -771,7 +784,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                     }
 
                     if (!audioSentByFallback) {
-                        if (totalSize > 0 && session.isOpen()) {
+                        if (totalSize > 0 && session.isOpen() && !aiTurn.isCancelled()) {
                             byte[] mergedPcm = new byte[totalSize];
                             int offset = 0;
                             for (byte[] chunk : pcmChunks) {
@@ -781,7 +794,8 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                             byte[] wavAudio = convertPcmToWav(mergedPcm);
                             log.info("[Session: {}] Sending merged audio - {} sentences, WAV size: {} bytes",
                                 sessionId, pcmChunks.size(), wavAudio.length);
-                            sendAudio(session, wavAudio, aiReply);
+                            aiTurn.replaceWithSingleChunk(aiReply);
+                            sendAudio(session, wavAudio, aiReply, aiTurn.turnId(), 0);
                         } else {
                             log.error("[Session: {}] All TTS calls returned empty audio", sessionId);
                             incrementCounter("app.voice.interview.tts.empty_audio", "status", "empty");
@@ -793,15 +807,15 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 recordTimerSinceNanos("app.voice.interview.llm.duration", llmStartNanos, "status", "success");
                 incrementCounter("app.voice.interview.llm.calls", "status", "success", "streaming", "false");
                 log.info("LLM response for session {}: '{}'", sessionId, aiReply);
+                aiTurn.setFullText(aiReply);
 
-                if (!session.isOpen()) {
-                    log.warn("WebSocket closed during LLM processing, discarding response for session {}", sessionId);
+                if (!session.isOpen() || aiTurn.isCancelled()) {
+                    log.warn("WebSocket closed or AI turn cancelled during LLM processing, discarding response for session {}", sessionId);
                     return;
                 }
 
                 sendSubtitle(session, userText, true);
-                sendTextMessage(session, aiReply, true);
-                saveMessage(sessionId, userText, aiReply);
+                sendTextMessage(session, aiReply, true, aiTurn.turnId());
 
                 long ttsStartNanos = System.nanoTime();
                 log.info("[Session: {}] Starting TTS synthesis for text (length: {})",
@@ -809,7 +823,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 byte[] aiAudio = ttsService.synthesize(aiReply);
                 recordTimerSinceNanos("app.voice.interview.tts.duration", ttsStartNanos, "status", "success");
 
-                if (!session.isOpen()) {
+                if (!session.isOpen() || aiTurn.isCancelled()) {
                     return;
                 }
 
@@ -818,7 +832,8 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                     incrementCounter("app.voice.interview.tts.empty_audio", "status", "empty");
                 } else {
                     byte[] wavAudio = convertPcmToWav(aiAudio);
-                    sendAudio(session, wavAudio, aiReply);
+                    aiTurn.replaceWithSingleChunk(aiReply);
+                    sendAudio(session, wavAudio, aiReply, aiTurn.turnId(), 0);
                 }
             }
 
@@ -835,8 +850,13 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 sendError(session, "AI响应失败: " + e.getMessage());
             }
         } finally {
-            state.aiSpeaking.set(false);
-            state.aiSpeakEndAt.set(System.currentTimeMillis() + AI_SPEAK_COOLDOWN_MS);
+            ActiveAiTurn currentTurn = activeAiTurns.get(sessionId);
+            if (currentTurn == null || currentTurn.isCancelled()) {
+                state.aiSpeaking.set(false);
+                state.aiSpeakEndAt.set(state.consumeInterruptedAiTurn()
+                    ? 0
+                    : System.currentTimeMillis() + AI_SPEAK_COOLDOWN_MS);
+            }
         }
     }
 
@@ -883,6 +903,12 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 }
                 flushMergedUtteranceToLlm(sessionId);
                 break;
+            case "interrupt":
+                handleInterrupt(sessionId, control);
+                break;
+            case "playback_complete":
+                handlePlaybackComplete(sessionId, control);
+                break;
             case "end_interview":
                 interviewService.endSession(sessionId);
                 break;
@@ -902,29 +928,46 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
     }
 
     private void sendAudio(WebSocketSession session, byte[] audio, String text) {
+        sendAudio(session, audio, text, null, null);
+    }
+
+    private void sendAudio(WebSocketSession session, byte[] audio, String text, String turnId, Integer index) {
         if (!session.isOpen()) {
             return;
         }
         String base64Audio = Base64.getEncoder().encodeToString(audio);
         log.info("Sending audio to frontend - WAV size: {} bytes, Base64 length: {}",
                 audio.length, base64Audio.length());
-        sendMessage(session, toJson(Map.of(
-                "type", "audio",
-                "data", base64Audio,
-                "text", text
-        )));
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "audio");
+        payload.put("data", base64Audio);
+        payload.put("text", text);
+        if (turnId != null) {
+            payload.put("turnId", turnId);
+        }
+        if (index != null) {
+            payload.put("index", index);
+        }
+        sendMessage(session, toJson(payload));
     }
 
     private void sendTextMessage(WebSocketSession session, String text) {
-        sendTextMessage(session, text, false);
+        sendTextMessage(session, text, false, null);
     }
 
     private void sendTextMessage(WebSocketSession session, String text, boolean isFinal) {
-        sendMessage(session, toJson(Map.of(
-                "type", "text",
-                "content", text,
-                "final", isFinal
-        )));
+        sendTextMessage(session, text, isFinal, null);
+    }
+
+    private void sendTextMessage(WebSocketSession session, String text, boolean isFinal, String turnId) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "text");
+        payload.put("content", text);
+        payload.put("final", isFinal);
+        if (turnId != null) {
+            payload.put("turnId", turnId);
+        }
+        sendMessage(session, toJson(payload));
     }
 
     private void sendError(WebSocketSession session, String error) {
@@ -947,30 +990,45 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         )));
     }
 
-    private void sendAudioChunk(WebSocketSession session, byte[] wavAudio, int index, boolean isLast) {
+    private void sendAudioChunk(
+            WebSocketSession session,
+            byte[] wavAudio,
+            int index,
+            boolean isLast,
+            String turnId,
+            String text) {
         if (!session.isOpen()) {
             return;
         }
         String base64Audio = Base64.getEncoder().encodeToString(wavAudio);
-        sendMessage(session, toJson(Map.of(
-                "type", "audio_chunk",
-                "data", base64Audio,
-                "index", index,
-                "isLast", isLast
-        )));
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "audio_chunk");
+        payload.put("data", base64Audio);
+        payload.put("index", index);
+        payload.put("isLast", isLast);
+        if (turnId != null) {
+            payload.put("turnId", turnId);
+        }
+        if (text != null) {
+            payload.put("text", text);
+        }
+        sendMessage(session, toJson(payload));
         log.debug("[Session] Sent audio chunk index={}, isLast={}, size={} bytes", index, isLast, wavAudio.length);
     }
 
-    private void sendAudioComplete(WebSocketSession session) {
+    private void sendAudioComplete(WebSocketSession session, String turnId) {
         if (session == null || !session.isOpen()) {
             return;
         }
-        sendMessage(session, toJson(Map.of(
-            "type", "control",
-            "action", "audio_complete",
-            "message", "面试官语音播放完成",
-            "timestamp", System.currentTimeMillis()
-        )));
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "control");
+        payload.put("action", "audio_complete");
+        payload.put("message", "面试官语音已全部下发");
+        payload.put("timestamp", System.currentTimeMillis());
+        if (turnId != null) {
+            payload.put("turnId", turnId);
+        }
+        sendMessage(session, toJson(payload));
     }
 
     private class OrderedTtsChunkEmitter {
@@ -979,6 +1037,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         private final WebSocketSession session;
         private final Semaphore ttsSemaphore;
         private final long ttsTimeoutSec;
+        private final ActiveAiTurn aiTurn;
         private final Map<Integer, CompletableFuture<byte[]>> futures = new ConcurrentHashMap<>();
         private final AtomicInteger nextIndex = new AtomicInteger();
         private final AtomicInteger emittedChunks = new AtomicInteger();
@@ -990,24 +1049,31 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 String sessionId,
                 WebSocketSession session,
                 Semaphore ttsSemaphore,
-                long ttsTimeoutSec) {
+                long ttsTimeoutSec,
+                ActiveAiTurn aiTurn) {
             this.sessionId = sessionId;
             this.session = session;
             this.ttsSemaphore = ttsSemaphore;
             this.ttsTimeoutSec = ttsTimeoutSec;
+            this.aiTurn = aiTurn;
             this.completion = CompletableFuture.supplyAsync(this::drainChunks, voicePipelineExecutor);
         }
 
         void submit(String sentence) {
             int index = nextIndex.getAndIncrement();
+            aiTurn.addChunk(index, sentence);
             ttsSemaphore.acquireUninterruptibly();
             CompletableFuture<byte[]> future = CompletableFuture.supplyAsync(() -> {
                 try {
+                    if (aiTurn.isCancelled()) {
+                        return new byte[0];
+                    }
                     return ttsService.synthesize(sentence);
                 } finally {
                     ttsSemaphore.release();
                 }
             }, voicePipelineExecutor);
+            aiTurn.addFuture(future);
 
             futures.put(index, future);
             synchronized (lock) {
@@ -1032,7 +1098,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 completion.cancel(true);
                 int emitted = emittedChunks.get();
                 if (emitted > 0) {
-                    sendAudioComplete(session);
+                    sendAudioComplete(session, aiTurn.turnId());
                 }
                 return emitted;
             }
@@ -1046,15 +1112,15 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                     if (future == null) {
                         int emitted = emittedChunks.get();
                         if (emitted > 0) {
-                            sendAudioComplete(session);
+                            sendAudioComplete(session, aiTurn.turnId());
                         }
                         return emitted;
                     }
 
                     try {
                         byte[] pcm = future.get(ttsTimeoutSec, TimeUnit.SECONDS);
-                        if (pcm != null && pcm.length > 0 && session.isOpen()) {
-                            sendAudioChunk(session, convertPcmToWav(pcm), index, false);
+                        if (pcm != null && pcm.length > 0 && session.isOpen() && !aiTurn.isCancelled()) {
+                            sendAudioChunk(session, convertPcmToWav(pcm), index, false, aiTurn.turnId(), aiTurn.chunkText(index));
                             emittedChunks.incrementAndGet();
                         }
                     } catch (Exception e) {
@@ -1071,7 +1137,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 log.warn("[Session: {}] Streaming TTS chunk emitter interrupted", sessionId);
                 int emitted = emittedChunks.get();
                 if (emitted > 0) {
-                    sendAudioComplete(session);
+                    sendAudioComplete(session, aiTurn.turnId());
                 }
                 return emitted;
             }
@@ -1080,6 +1146,9 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         private CompletableFuture<byte[]> waitForFuture(int index) throws InterruptedException {
             synchronized (lock) {
                 while (!futures.containsKey(index)) {
+                    if (aiTurn.isCancelled()) {
+                        return null;
+                    }
                     if (totalChunks >= 0 && index >= totalChunks) {
                         return null;
                     }
@@ -1088,6 +1157,253 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 return futures.get(index);
             }
         }
+    }
+
+
+    private ActiveAiTurn startAiTurn(String sessionId, WebSocketSession session, String userText) {
+        ActiveAiTurn aiTurn = new ActiveAiTurn(sessionId, UUID.randomUUID().toString(), userText);
+        ActiveAiTurn previousTurn = activeAiTurns.put(sessionId, aiTurn);
+        if (previousTurn != null) {
+            previousTurn.cancel();
+        }
+        SessionState state = sessionStates.get(sessionId);
+        if (state != null) {
+            state.aiSpeaking.set(true);
+        }
+        sendMessage(session, toJson(Map.of(
+            "type", "control",
+            "action", "ai_turn_start",
+            "turnId", aiTurn.turnId(),
+            "timestamp", System.currentTimeMillis()
+        )));
+        return aiTurn;
+    }
+
+    private void handlePlaybackComplete(String sessionId, WebSocketControlMessage control) {
+        ActiveAiTurn aiTurn = activeAiTurns.get(sessionId);
+        String turnId = dataString(control, "turnId");
+        if (aiTurn == null || (turnId != null && !turnId.equals(aiTurn.turnId()))) {
+            markAiPlaybackFinished(sessionId, false);
+            return;
+        }
+        int lastPlayedChunkIndex = dataInt(control, "lastPlayedChunkIndex", Integer.MAX_VALUE);
+        String committedText = aiTurn.fullText();
+        if (committedText == null || committedText.isBlank()) {
+            committedText = aiTurn.textUntil(lastPlayedChunkIndex);
+        }
+        finishAiTurn(aiTurn, committedText);
+        markAiPlaybackFinished(sessionId, false);
+    }
+
+    private void handleInterrupt(String sessionId, WebSocketControlMessage control) {
+        ActiveAiTurn aiTurn = activeAiTurns.get(sessionId);
+        if (aiTurn == null) {
+            markAiPlaybackFinished(sessionId, true);
+            sendInterruptAck(sessionId, null);
+            return;
+        }
+        String turnId = dataString(control, "turnId");
+        if (turnId != null && !turnId.equals(aiTurn.turnId())) {
+            markAiPlaybackFinished(sessionId, true);
+            sendInterruptAck(sessionId, turnId);
+            return;
+        }
+
+        int lastPlayedChunkIndex = dataInt(control, "lastPlayedChunkIndex", -1);
+        String heardText = aiTurn.textUntil(lastPlayedChunkIndex);
+        aiTurn.cancel();
+        finishAiTurn(aiTurn, heardText);
+
+        SessionState state = sessionStates.get(sessionId);
+        if (state != null) {
+            state.markInterruptedAiTurn();
+            state.aiSpeaking.set(false);
+            state.aiSpeakEndAt.set(0);
+            state.isProcessing().set(false);
+            Thread processingThread = state.getProcessingThread();
+            if (processingThread != null) {
+                processingThread.interrupt();
+            }
+        }
+        sendInterruptAck(sessionId, aiTurn.turnId());
+        log.info("AI turn interrupted: sessionId={}, turnId={}, lastPlayedChunkIndex={}",
+            sessionId, aiTurn.turnId(), lastPlayedChunkIndex);
+    }
+
+    private void sendInterruptAck(String sessionId, String turnId) {
+        WebSocketSession session = sessions.get(sessionId);
+        if (session == null || !session.isOpen()) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "control");
+        payload.put("action", "interrupt_ack");
+        payload.put("message", "已打断当前回答");
+        payload.put("timestamp", System.currentTimeMillis());
+        if (turnId != null) {
+            payload.put("turnId", turnId);
+        }
+        sendMessage(session, toJson(payload));
+    }
+
+    private void markAiPlaybackFinished(String sessionId, boolean interrupted) {
+        SessionState state = sessionStates.get(sessionId);
+        if (state == null) {
+            return;
+        }
+        if (interrupted) {
+            state.markInterruptedAiTurn();
+            state.aiSpeakEndAt.set(0);
+        } else {
+            state.aiSpeakEndAt.set(System.currentTimeMillis() + AI_SPEAK_COOLDOWN_MS);
+        }
+        state.aiSpeaking.set(false);
+    }
+
+    private void finishAiTurn(ActiveAiTurn aiTurn, String aiText) {
+        if (aiTurn == null || !aiTurn.markCommitted()) {
+            return;
+        }
+        activeAiTurns.remove(aiTurn.sessionId(), aiTurn);
+        String userText = VoiceInterviewMessageEntity.trimToNull(aiTurn.userText());
+        String committedAiText = VoiceInterviewMessageEntity.trimToNull(aiText);
+        if (userText == null && committedAiText == null) {
+            return;
+        }
+        saveMessage(aiTurn.sessionId(), userText, committedAiText);
+    }
+
+    private String dataString(WebSocketControlMessage control, String key) {
+        if (control == null || control.getData() == null) {
+            return null;
+        }
+        Object value = control.getData().get(key);
+        if (value == null) {
+            return null;
+        }
+        String text = String.valueOf(value).trim();
+        return text.isEmpty() ? null : text;
+    }
+
+    private int dataInt(WebSocketControlMessage control, String key, int defaultValue) {
+        if (control == null || control.getData() == null) {
+            return defaultValue;
+        }
+        Object value = control.getData().get(key);
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof String text && !text.isBlank()) {
+            try {
+                return Integer.parseInt(text);
+            } catch (NumberFormatException e) {
+                return defaultValue;
+            }
+        }
+        return defaultValue;
+    }
+
+    private static class ActiveAiTurn {
+        private final String sessionId;
+        private final String turnId;
+        private final String userText;
+        private final List<AiChunk> chunks = Collections.synchronizedList(new ArrayList<>());
+        private final List<CompletableFuture<byte[]>> futures = Collections.synchronizedList(new ArrayList<>());
+        private final AtomicBoolean committed = new AtomicBoolean(false);
+        private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        private volatile String fullText;
+
+        ActiveAiTurn(String sessionId, String turnId, String userText) {
+            this.sessionId = sessionId;
+            this.turnId = turnId;
+            this.userText = userText;
+        }
+
+        String sessionId() {
+            return sessionId;
+        }
+
+        String turnId() {
+            return turnId;
+        }
+
+        String userText() {
+            return userText;
+        }
+
+        String fullText() {
+            return fullText;
+        }
+
+        void setFullText(String fullText) {
+            this.fullText = fullText;
+        }
+
+        void addChunk(int index, String text) {
+            chunks.add(new AiChunk(index, text));
+        }
+
+        void replaceWithSingleChunk(String text) {
+            synchronized (chunks) {
+                chunks.clear();
+                chunks.add(new AiChunk(0, text));
+            }
+        }
+
+        void addFuture(CompletableFuture<byte[]> future) {
+            futures.add(future);
+        }
+
+        String chunkText(int index) {
+            synchronized (chunks) {
+                for (AiChunk chunk : chunks) {
+                    if (chunk.index() == index) {
+                        return chunk.text();
+                    }
+                }
+            }
+            return null;
+        }
+
+        String textUntil(int lastPlayedChunkIndex) {
+            if (lastPlayedChunkIndex < 0) {
+                return null;
+            }
+            List<AiChunk> copy;
+            synchronized (chunks) {
+                copy = new ArrayList<>(chunks);
+            }
+            copy.sort((left, right) -> Integer.compare(left.index(), right.index()));
+            StringBuilder builder = new StringBuilder();
+            for (AiChunk chunk : copy) {
+                if (chunk.index() <= lastPlayedChunkIndex && chunk.text() != null) {
+                    builder.append(chunk.text());
+                }
+            }
+            return builder.toString();
+        }
+
+        boolean markCommitted() {
+            return committed.compareAndSet(false, true);
+        }
+
+        boolean isCancelled() {
+            return cancelled.get();
+        }
+
+        void cancel() {
+            if (!cancelled.compareAndSet(false, true)) {
+                return;
+            }
+            synchronized (futures) {
+                for (CompletableFuture<byte[]> future : futures) {
+                    future.cancel(true);
+                }
+            }
+        }
+    }
+
+    private record AiChunk(int index, String text) {
     }
 
     private void recordTimerSinceNanos(String metricName, long startNanos, String... tags) {
@@ -1372,6 +1688,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         private final AtomicLong mergeStartedAt = new AtomicLong(0);
         /** 最近一次 STT 活动时间（partial/final） */
         private final AtomicLong lastSttActivityAt = new AtomicLong(System.currentTimeMillis());
+        private final AtomicBoolean interruptedAiTurn = new AtomicBoolean(false);
         /** 当前正在执行 LLM+TTS 管线的虚拟线程，断连时可中断 */
         private volatile Thread processingThread = null;
 
@@ -1472,6 +1789,14 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
 
         public Thread getProcessingThread() {
             return processingThread;
+        }
+
+        void markInterruptedAiTurn() {
+            interruptedAiTurn.set(true);
+        }
+
+        boolean consumeInterruptedAiTurn() {
+            return interruptedAiTurn.getAndSet(false);
         }
 
         boolean isAiSpeakingOrCooldown() {

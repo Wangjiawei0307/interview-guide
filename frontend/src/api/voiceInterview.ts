@@ -87,7 +87,7 @@ export interface SessionMeta {
 // WebSocket 消息类型
 export interface WebSocketAudioMessage {
   type: 'audio';
-  data: string; // Base64 编码的音频
+  data: string;
   timestamp?: number;
 }
 
@@ -99,27 +99,33 @@ export interface WebSocketSubtitleMessage {
 
 export interface WebSocketAudioResponseMessage {
   type: 'audio';
-  data: string; // Base64 编码的音频
+  data: string;
   text: string;
+  turnId?: string;
+  index?: number;
 }
 
 export interface WebSocketTextMessage {
   type: 'text';
   content: string;
   final?: boolean;
+  turnId?: string;
 }
 
 export interface WebSocketAudioChunkMessage {
   type: 'audio_chunk';
-  data: string; // Base64 WAV
+  data: string;
   index: number;
   isLast: boolean;
+  turnId?: string;
+  text?: string;
 }
 
 export interface WebSocketControlResponseMessage {
   type: 'control';
   action: string;
   message?: string;
+  turnId?: string;
   timestamp?: number;
 }
 
@@ -141,10 +147,10 @@ export type WebSocketMessage =
 export interface WebSocketEventHandlers {
   onMessage?: (message: WebSocketMessage) => void;
   onSubtitle?: (text: string, isFinal: boolean) => void;
-  onAudioResponse?: (audioData: string, text: string) => void;
-  onTextResponse?: (text: string, isFinal: boolean) => void;
-  onAudioChunk?: (data: string, index: number, isLast: boolean) => void;
-  onControl?: (action: string, message?: string) => void;
+  onAudioResponse?: (audioData: string, text: string, turnId?: string, index?: number) => void;
+  onTextResponse?: (text: string, isFinal: boolean, turnId?: string) => void;
+  onAudioChunk?: (data: string, index: number, isLast: boolean, turnId?: string, text?: string) => void;
+  onControl?: (action: string, message?: string, turnId?: string) => void;
   onErrorMessage?: (message: string) => void;
   onOpen?: () => void;
   onClose?: (event: CloseEvent) => void;
@@ -302,23 +308,23 @@ export class VoiceInterviewWebSocket {
               // 检查是否是 AI 响应（包含 text 字段）
               if ('text' in message) {
                 const audioMsg = message as WebSocketAudioResponseMessage;
-                this.handlers.onAudioResponse?.(audioMsg.data, audioMsg.text);
+                this.handlers.onAudioResponse?.(audioMsg.data, audioMsg.text, audioMsg.turnId, audioMsg.index);
               }
               break;
             case 'audio_chunk':
               if ('index' in message) {
                 const chunkMsg = message as WebSocketAudioChunkMessage;
-                this.handlers.onAudioChunk?.(chunkMsg.data, chunkMsg.index, chunkMsg.isLast);
+                this.handlers.onAudioChunk?.(chunkMsg.data, chunkMsg.index, chunkMsg.isLast, chunkMsg.turnId, chunkMsg.text);
               }
               break;
             case 'text':
               if ('content' in message) {
                 const textMsg = message as WebSocketTextMessage;
-                this.handlers.onTextResponse?.(textMsg.content, !!textMsg.final);
+                this.handlers.onTextResponse?.(textMsg.content, !!textMsg.final, textMsg.turnId);
               }
               break;
             case 'control':
-              this.handlers.onControl?.(message.action, message.message);
+              this.handlers.onControl?.(message.action, message.message, message.turnId);
               break;
             case 'error':
               this.handlers.onErrorMessage?.(message.message);
