@@ -127,6 +127,7 @@ export interface WebSocketControlResponseMessage {
   message?: string;
   turnId?: string;
   timestamp?: number;
+  truncated?: boolean;
 }
 
 export interface WebSocketErrorMessage {
@@ -150,7 +151,7 @@ export interface WebSocketEventHandlers {
   onAudioResponse?: (audioData: string, text: string, turnId?: string, index?: number) => void;
   onTextResponse?: (text: string, isFinal: boolean, turnId?: string) => void;
   onAudioChunk?: (data: string, index: number, isLast: boolean, turnId?: string, text?: string) => void;
-  onControl?: (action: string, message?: string, turnId?: string) => void;
+  onControl?: (action: string, message?: string, turnId?: string, truncated?: boolean) => void;
   onErrorMessage?: (message: string) => void;
   onOpen?: () => void;
   onClose?: (event: CloseEvent) => void;
@@ -324,7 +325,7 @@ export class VoiceInterviewWebSocket {
               }
               break;
             case 'control':
-              this.handlers.onControl?.(message.action, message.message, message.turnId);
+              this.handlers.onControl?.(message.action, message.message, message.turnId, message.truncated);
               break;
             case 'error':
               this.handlers.onErrorMessage?.(message.message);

@@ -722,9 +722,15 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 if (chunkEmitter != null) {
                     long ttsStartNanos = System.nanoTime();
                     chunkEmitter.finish();
-                    int emittedChunks = chunkEmitter.awaitCompletion();
+                    TtsChunkEmissionResult chunkResult = chunkEmitter.awaitCompletion();
                     recordTimerSinceNanos("app.voice.interview.tts.duration", ttsStartNanos, "status", "success");
-                    if (emittedChunks == 0 && session.isOpen() && !aiTurn.isCancelled()) {
+                    if (chunkResult.failed() && chunkResult.emittedChunks() > 0) {
+                        aiTurn.markTruncated();
+                    }
+                    if (chunkResult.emittedChunks() > 0 && session.isOpen() && !aiTurn.isCancelled()) {
+                        sendAudioComplete(session, aiTurn.turnId(), chunkResult.failed());
+                    }
+                    if (chunkResult.emittedChunks() == 0 && session.isOpen() && !aiTurn.isCancelled()) {
                         log.info("[Session: {}] Streaming TTS produced no chunks, falling back to full-text TTS",
                             sessionId);
                         try {
@@ -764,9 +770,8 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                         return;
                     }
 
-                    // 有句子级 TTS 失败且无成功结果时，用完整文本做一次兜底 TTS
-                    if (totalSize == 0 && failedCount > 0 && session.isOpen() && !aiTurn.isCancelled()) {
-                        log.info("[Session: {}] All {} sentence TTS calls failed, falling back to full-text TTS",
+                    if (failedCount > 0 && session.isOpen() && !aiTurn.isCancelled()) {
+                        log.info("[Session: {}] {} sentence TTS calls failed, falling back to full-text TTS",
                             sessionId, failedCount);
                         try {
                             byte[] fallbackPcm = ttsService.synthesize(aiReply);
@@ -777,13 +782,21 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                                 aiTurn.replaceWithSingleChunk(aiReply);
                                 sendAudio(session, wavAudio, aiReply, aiTurn.turnId(), 0);
                                 audioSentByFallback = true;
+                            } else {
+                                log.warn("[Session: {}] Fallback TTS returned empty audio", sessionId);
                             }
                         } catch (Exception e) {
                             log.warn("[Session: {}] Fallback TTS also failed: {}", sessionId, e.getMessage());
                         }
                     }
 
-                    if (!audioSentByFallback) {
+                    if (!audioSentByFallback && failedCount > 0) {
+                        log.warn("[Session: {}] Suppressing partial merged audio because {} sentence TTS calls failed",
+                            sessionId, failedCount);
+                        incrementCounter("app.voice.interview.tts.partial_suppressed", "status", "failed");
+                    }
+
+                    if (!audioSentByFallback && failedCount == 0) {
                         if (totalSize > 0 && session.isOpen() && !aiTurn.isCancelled()) {
                             byte[] mergedPcm = new byte[totalSize];
                             int offset = 0;
@@ -1016,15 +1029,18 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         log.debug("[Session] Sent audio chunk index={}, isLast={}, size={} bytes", index, isLast, wavAudio.length);
     }
 
-    private void sendAudioComplete(WebSocketSession session, String turnId) {
+    private void sendAudioComplete(WebSocketSession session, String turnId, boolean truncated) {
         if (session == null || !session.isOpen()) {
             return;
         }
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("type", "control");
         payload.put("action", "audio_complete");
-        payload.put("message", "面试官语音已全部下发");
+        payload.put("message", truncated
+            ? "AI audio was truncated because one TTS chunk failed"
+            : "AI audio has been fully sent");
         payload.put("timestamp", System.currentTimeMillis());
+        payload.put("truncated", truncated);
         if (turnId != null) {
             payload.put("turnId", turnId);
         }
@@ -1041,8 +1057,9 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         private final Map<Integer, CompletableFuture<byte[]>> futures = new ConcurrentHashMap<>();
         private final AtomicInteger nextIndex = new AtomicInteger();
         private final AtomicInteger emittedChunks = new AtomicInteger();
+        private final AtomicBoolean stopped = new AtomicBoolean(false);
         private final Object lock = new Object();
-        private final CompletableFuture<Integer> completion;
+        private final CompletableFuture<TtsChunkEmissionResult> completion;
         private volatile int totalChunks = -1;
 
         OrderedTtsChunkEmitter(
@@ -1060,9 +1077,16 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         }
 
         void submit(String sentence) {
+            if (stopped.get() || aiTurn.isCancelled()) {
+                return;
+            }
             int index = nextIndex.getAndIncrement();
             aiTurn.addChunk(index, sentence);
             ttsSemaphore.acquireUninterruptibly();
+            if (stopped.get() || aiTurn.isCancelled()) {
+                ttsSemaphore.release();
+                return;
+            }
             CompletableFuture<byte[]> future = CompletableFuture.supplyAsync(() -> {
                 try {
                     if (aiTurn.isCancelled()) {
@@ -1088,7 +1112,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
             }
         }
 
-        int awaitCompletion() {
+        TtsChunkEmissionResult awaitCompletion() {
             long timeoutSec = Math.max(ttsTimeoutSec + 2, (ttsTimeoutSec + 1) * Math.max(1, nextIndex.get()));
             try {
                 return completion.get(timeoutSec, TimeUnit.SECONDS);
@@ -1096,37 +1120,43 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
                 log.warn("[Session: {}] Streaming TTS chunk emitter did not finish cleanly: {}",
                     sessionId, e.getMessage());
                 completion.cancel(true);
+                stopped.set(true);
                 int emitted = emittedChunks.get();
                 if (emitted > 0) {
-                    sendAudioComplete(session, aiTurn.turnId());
+                    aiTurn.markTruncated();
                 }
-                return emitted;
+                aiTurn.cancelFutures();
+                return new TtsChunkEmissionResult(emitted, true);
             }
         }
 
-        private int drainChunks() {
+        private TtsChunkEmissionResult drainChunks() {
             int index = 0;
             try {
                 while (true) {
                     CompletableFuture<byte[]> future = waitForFuture(index);
                     if (future == null) {
                         int emitted = emittedChunks.get();
-                        if (emitted > 0) {
-                            sendAudioComplete(session, aiTurn.turnId());
-                        }
-                        return emitted;
+                        return new TtsChunkEmissionResult(emitted, false);
                     }
 
                     try {
                         byte[] pcm = future.get(ttsTimeoutSec, TimeUnit.SECONDS);
-                        if (pcm != null && pcm.length > 0 && session.isOpen() && !aiTurn.isCancelled()) {
+                        if (aiTurn.isCancelled() || !session.isOpen()) {
+                            return new TtsChunkEmissionResult(emittedChunks.get(), false);
+                        }
+                        if (pcm != null && pcm.length > 0) {
                             sendAudioChunk(session, convertPcmToWav(pcm), index, false, aiTurn.turnId(), aiTurn.chunkText(index));
                             emittedChunks.incrementAndGet();
+                        } else {
+                            log.warn("[Session: {}] Streaming TTS chunk {} returned empty audio", sessionId, index);
+                            return stopAfterChunkFailure();
                         }
                     } catch (Exception e) {
                         future.cancel(true);
                         log.warn("[Session: {}] Streaming TTS chunk {} failed: {}",
                             sessionId, index, e.getMessage());
+                        return stopAfterChunkFailure();
                     } finally {
                         futures.remove(index);
                         index++;
@@ -1135,12 +1165,18 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 log.warn("[Session: {}] Streaming TTS chunk emitter interrupted", sessionId);
-                int emitted = emittedChunks.get();
-                if (emitted > 0) {
-                    sendAudioComplete(session, aiTurn.turnId());
-                }
-                return emitted;
+                return stopAfterChunkFailure();
             }
+        }
+
+        private TtsChunkEmissionResult stopAfterChunkFailure() {
+            stopped.set(true);
+            int emitted = emittedChunks.get();
+            if (emitted > 0) {
+                aiTurn.markTruncated();
+            }
+            aiTurn.cancelFutures();
+            return new TtsChunkEmissionResult(emitted, true);
         }
 
         private CompletableFuture<byte[]> waitForFuture(int index) throws InterruptedException {
@@ -1158,7 +1194,6 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
             }
         }
     }
-
 
     private ActiveAiTurn startAiTurn(String sessionId, WebSocketSession session, String userText) {
         ActiveAiTurn aiTurn = new ActiveAiTurn(sessionId, UUID.randomUUID().toString(), userText);
@@ -1187,7 +1222,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
             return;
         }
         int lastPlayedChunkIndex = dataInt(control, "lastPlayedChunkIndex", Integer.MAX_VALUE);
-        String committedText = aiTurn.fullText();
+        String committedText = aiTurn.isTruncated() ? null : aiTurn.fullText();
         if (committedText == null || committedText.isBlank()) {
             committedText = aiTurn.textUntil(lastPlayedChunkIndex);
         }
@@ -1311,6 +1346,7 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
         private final List<CompletableFuture<byte[]>> futures = Collections.synchronizedList(new ArrayList<>());
         private final AtomicBoolean committed = new AtomicBoolean(false);
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        private final AtomicBoolean truncated = new AtomicBoolean(false);
         private volatile String fullText;
 
         ActiveAiTurn(String sessionId, String turnId, String userText) {
@@ -1391,16 +1427,31 @@ public class VoiceInterviewWebSocketHandler extends TextWebSocketHandler impleme
             return cancelled.get();
         }
 
-        void cancel() {
-            if (!cancelled.compareAndSet(false, true)) {
-                return;
-            }
+        boolean isTruncated() {
+            return truncated.get();
+        }
+
+        void markTruncated() {
+            truncated.set(true);
+        }
+
+        void cancelFutures() {
             synchronized (futures) {
                 for (CompletableFuture<byte[]> future : futures) {
                     future.cancel(true);
                 }
             }
         }
+
+        void cancel() {
+            if (!cancelled.compareAndSet(false, true)) {
+                return;
+            }
+            cancelFutures();
+        }
+    }
+
+    private record TtsChunkEmissionResult(int emittedChunks, boolean failed) {
     }
 
     private record AiChunk(int index, String text) {

@@ -99,6 +99,8 @@ export default function VoiceInterviewPage() {
   const audioVolumeAnimationRef = useRef<number | null>(null);
   const currentAiTurnIdRef = useRef('');
   const lastPlayedChunkIndexRef = useRef(-1);
+  const playedAiChunkTextsRef = useRef<Map<number, string>>(new Map());
+  const chunkAudioTruncatedRef = useRef(false);
   const playbackCompleteSentRef = useRef(false);
   const interruptTriggeredRef = useRef(false);
   const userSpeakingDuringAiRef = useRef(false);
@@ -146,6 +148,14 @@ export default function VoiceInterviewPage() {
     });
     lastAiCommittedTextRef.current = normalized;
     setAiText(prev => prev?.trim() === normalized ? '' : prev);
+  }, []);
+
+  const getPlayedAiChunkText = useCallback(() => {
+    return Array.from(playedAiChunkTextsRef.current.entries())
+      .sort(([left], [right]) => left - right)
+      .map(([, text]) => text)
+      .join('')
+      .trim();
   }, []);
 
   const estimateWavDurationMs = useCallback((base64Wav: string) => {
@@ -282,6 +292,8 @@ export default function VoiceInterviewPage() {
     setAiAudio('');
     currentAiTurnIdRef.current = '';
     lastPlayedChunkIndexRef.current = -1;
+    playedAiChunkTextsRef.current.clear();
+    chunkAudioTruncatedRef.current = false;
   }, [
     clearAudioPlaybackWatchdog,
     clearChunkDrainCheck,
@@ -308,6 +320,8 @@ export default function VoiceInterviewPage() {
       chunkPlaybackSourceRef.current = null;
     }
     chunkQueueRef.current = [];
+    playedAiChunkTextsRef.current.clear();
+    chunkAudioTruncatedRef.current = false;
     isChunkPlayingRef.current = false;
     const audio = audioPlayerRef.current;
     if (audio) {
@@ -328,6 +342,8 @@ export default function VoiceInterviewPage() {
     if (currentAiTurnIdRef.current !== turnId) {
       currentAiTurnIdRef.current = turnId;
       lastPlayedChunkIndexRef.current = -1;
+      playedAiChunkTextsRef.current.clear();
+      chunkAudioTruncatedRef.current = false;
       playbackCompleteSentRef.current = false;
       interruptTriggeredRef.current = false;
       userSpeakingDuringAiRef.current = false;
@@ -350,6 +366,8 @@ export default function VoiceInterviewPage() {
     if (chunk.turnId && currentAiTurnIdRef.current !== chunk.turnId) {
       currentAiTurnIdRef.current = chunk.turnId;
       lastPlayedChunkIndexRef.current = -1;
+      playedAiChunkTextsRef.current.clear();
+      chunkAudioTruncatedRef.current = false;
       playbackCompleteSentRef.current = false;
       interruptTriggeredRef.current = false;
     }
@@ -361,6 +379,9 @@ export default function VoiceInterviewPage() {
       chunkPlaybackSourceRef.current = null;
       if (!interruptTriggeredRef.current && (!chunk.turnId || chunk.turnId === currentAiTurnIdRef.current)) {
         lastPlayedChunkIndexRef.current = Math.max(lastPlayedChunkIndexRef.current, chunk.index);
+        if (chunk.text?.trim()) {
+          playedAiChunkTextsRef.current.set(chunk.index, chunk.text);
+        }
       }
       playNextChunk();
     };
@@ -379,10 +400,15 @@ export default function VoiceInterviewPage() {
         setAiSpeaking(false);
         setIsSubmitting(false);
         clearPendingAiTextCommit();
-        commitAiMessage(aiTextRef.current.trim());
+        const committedText = chunkAudioTruncatedRef.current
+          ? getPlayedAiChunkText()
+          : aiTextRef.current.trim();
+        commitAiMessage(committedText);
         setAiText('');
         currentAiTurnIdRef.current = '';
         lastPlayedChunkIndexRef.current = -1;
+        playedAiChunkTextsRef.current.clear();
+        chunkAudioTruncatedRef.current = false;
       } else if (Date.now() - startedAt > maxDrainWaitMs) {
         clearChunkDrainCheck();
         restoreAiVolume();
@@ -394,6 +420,7 @@ export default function VoiceInterviewPage() {
     clearChunkDrainCheck,
     clearPendingAiTextCommit,
     commitAiMessage,
+    getPlayedAiChunkText,
     restoreAiVolume,
     sendPlaybackComplete,
     setAiSpeaking,
@@ -677,7 +704,7 @@ export default function VoiceInterviewPage() {
     onAudioChunk: (data: string, index: number, isLast: boolean, turnId?: string, text?: string) => {
       handleAudioChunk(data, index, isLast, turnId, text);
     },
-    onControl: (action: string, message?: string, turnId?: string) => {
+    onControl: (action: string, message?: string, turnId?: string, truncated?: boolean) => {
       if (action === 'ai_turn_start') {
         activateAiTurn(turnId);
         return;
@@ -696,6 +723,7 @@ export default function VoiceInterviewPage() {
       }
       if (action === 'audio_complete') {
         activateAiTurn(turnId);
+        chunkAudioTruncatedRef.current = !!truncated;
         scheduleChunkDrainCompletion();
         return;
       }
